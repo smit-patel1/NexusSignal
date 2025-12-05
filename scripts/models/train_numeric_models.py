@@ -1,5 +1,5 @@
 """
-Phase 3: Numeric Model Training & SOTA Ensemble Engine
+Phase 3: Advanced Numeric Model Training Pipeline
 
 Trains per-ticker ensemble models to predict:
 - target_1h_return
@@ -7,9 +7,11 @@ Trains per-ticker ensemble models to predict:
 - target_24h_return
 
 Architecture:
-- Group A: LightGBM, XGBoost, CatBoost (all tickers)
-- Group B: LSTM, TCN (configurable subset, for comparison)
-- Ensemble: CatBoost meta-learner over gradient boosting models
+- Linear: Ridge, Lasso, ElasticNet
+- Trees: RandomForest, HistGradientBoosting
+- Boosting: LightGBM, XGBoost, CatBoost
+- Neural (optional): DeepResidualLSTM, AdvancedTCN
+- Ensemble: Cross-validated stacking with meta-features
 """
 
 import sys
@@ -23,249 +25,105 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# Gradient Boosting Models
-import lightgbm as lgb
-import xgboost as xgb
-from catboost import CatBoostRegressor
-
-# PyTorch + Lightning
 import torch
-import torch.nn as nn
+from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+from pytorch_lightning.callbacks import EarlyStopping
 
-# Scikit-learn
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
-# Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from backend.app.config import TICKERS
 from scripts.utils.parquet_utils import read_parquet
-from scripts.models.utils import (
-    time_based_split,
-    create_sequence_dataset,
-    compute_metrics,
-    print_metrics,
+from scripts.models.advanced_preprocessing import (
+    filter_bad_data,
+    preprocess_targets,
+    inverse_preprocess_targets,
+    robust_scale_features,
 )
+from scripts.models.advanced_features import build_alpha_features
+from scripts.models.advanced_neural_models import (
+    DeepResidualLSTM,
+    AdvancedTCN,
+    TimeSeriesDataset,
+)
+from scripts.models.advanced_ensemble import (
+    create_diverse_base_models,
+    train_stacking_ensemble,
+    predict_with_ensemble,
+)
+from scripts.models.utils import create_sequence_dataset, compute_metrics, print_metrics
 
 # ======================================================================
 # CONFIGURATION
 # ======================================================================
 
-# Neural model configuration
-TRAIN_NEURAL = True  # Set False to skip LSTM/TCN (faster)
-NEURAL_TICKERS = TICKERS[:10]  # Train neural models only for first 10 tickers
-LOOKBACK_WINDOW = 32  # Sequence length for LSTM/TCN
+TRAIN_NEURAL = True
+NEURAL_TICKERS = TICKERS[:10]
+LOOKBACK_WINDOW = 32
 
-# Data paths
+USE_KALMAN_FILTER = False
+TARGET_TRANSFORM = "log"
+NORMALIZE_TARGETS = True
+
+FILTER_BAD_DATA = True
+MIN_VOLUME_PERCENTILE = 1.0
+MAX_PRICE_JUMP = 20.0
+
+BUILD_ALPHA_FEATURES = True
+INCLUDE_INTERACTIONS = True
+
+USE_STACKING = True
+USE_META_FEATURES = True
+STACKING_FOLDS = 5
+
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "processed" / "features"
 MODELS_DIR = Path(__file__).parent.parent.parent / "models" / "numeric"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Target columns
 TARGETS = ["target_1h_return", "target_4h_return", "target_24h_return"]
 
 # ======================================================================
-# PYTORCH DATASETS + MODELS
+# HELPER FUNCTIONS
 # ======================================================================
 
 
-class TimeSeriesDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.FloatTensor(y)
+def create_horizon_specific_features(
+    df: pd.DataFrame, horizon: str
+) -> pd.DataFrame:
+    """Create horizon-specific features without dropping rows."""
+    df_horizon = df.copy()
 
-    def __len__(self) -> int:
-        return len(self.X)
+    if horizon == "1h":
+        periods = [1, 2, 3]
+    elif horizon == "4h":
+        periods = [4, 8, 12]
+    elif horizon == "24h":
+        periods = [24, 48, 72]
+    else:
+        periods = [1]
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.X[idx], self.y[idx]
-
-
-class LSTMRegressor(pl.LightningModule):
-    def __init__(
-        self,
-        n_features: int,
-        hidden_size: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.2,
-        learning_rate: float = 0.001,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.lstm = nn.LSTM(
-            input_size=n_features,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
-            batch_first=True,
-        )
-
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
-        )
-
-        self.learning_rate = learning_rate
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        return self.fc(out).squeeze()
-
-    def training_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def validation_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-
-
-class TCNBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        padding = (kernel_size - 1) * dilation
-
-        self.conv1 = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-        )
-        self.relu1 = nn.ReLU()
-        self.drop1 = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv1d(
-            in_channels=out_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            dilation=dilation,
-        )
-        self.relu2 = nn.ReLU()
-        self.drop2 = nn.Dropout(dropout)
-
-        self.downsample = (
-            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
-        )
-        self.final_relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1(x)
-        out = out[:, :, :-self.conv1.padding[0]]
-        out = self.relu1(out)
-        out = self.drop1(out)
-
-        out = self.conv2(out)
-        out = out[:, :, :-self.conv2.padding[0]]
-        out = self.relu2(out)
-        out = self.drop2(out)
-
-        res = x if self.downsample is None else self.downsample(x)
-        if res.size(2) > out.size(2):
-            res = res[:, :, : out.size(2)]
-        elif res.size(2) < out.size(2):
-            out = out[:, :, : res.size(2)]
-
-        return self.final_relu(out + res)
-
-
-class TCNRegressor(pl.LightningModule):
-    def __init__(
-        self,
-        n_features: int,
-        num_channels: Optional[List[int]] = None,
-        kernel_size: int = 3,
-        dropout: float = 0.2,
-        learning_rate: float = 0.001,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        if num_channels is None:
-            num_channels = [32, 64, 32]
-
-        layers: List[nn.Module] = []
-        for i, out_channels in enumerate(num_channels):
-            in_channels = n_features if i == 0 else num_channels[i - 1]
-            dilation = 2 ** i
-            layers.append(
-                TCNBlock(
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    dropout=dropout,
-                )
+    if "close" in df_horizon.columns:
+        for period in periods:
+            df_horizon[f"return_{period}p"] = df_horizon["close"].pct_change(period)
+            df_horizon[f"volatility_{period}p"] = (
+                df_horizon["close"].pct_change().rolling(period).std()
             )
 
-        self.tcn = nn.Sequential(*layers)
-        self.fc = nn.Sequential(
-            nn.Linear(num_channels[-1], 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
+        base_period = periods[0]
+        df_horizon[f"momentum_{horizon}"] = (
+            df_horizon["close"] / df_horizon["close"].shift(base_period) - 1
         )
-        self.learning_rate = learning_rate
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.transpose(1, 2)
-        out = self.tcn(x)
-        out = out[:, :, -1]
-        return self.fc(out).squeeze()
+        delta = df_horizon["close"].diff()
+        gain = delta.where(delta > 0, 0).rolling(base_period * 2).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(base_period * 2).mean()
+        rs = gain / loss.replace(0, 1e-10)
+        df_horizon[f"rsi_{horizon}"] = 100 - (100 / (1 + rs))
 
-    def training_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def validation_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int
-    ) -> torch.Tensor:
-        x, y = batch
-        y_hat = self(x)
-        loss = nn.MSELoss()(y_hat, y)
-        self.log("val_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-
-
-# ======================================================================
-# MODEL TRAINING UTILITIES
-# ======================================================================
+    return df_horizon
 
 
 def train_gradient_boosting_models(
@@ -273,62 +131,51 @@ def train_gradient_boosting_models(
     y_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
-) -> Dict[str, dict]:
-    models: Dict[str, any] = {}
-    val_preds: Dict[str, np.ndarray] = {}
+) -> Dict[str, any]:
+    """Train all base models with early stopping."""
+    base_models = create_diverse_base_models()
+    trained_models = {}
+    val_preds = {}
 
-    print("    Training LightGBM...")
-    lgb_model = lgb.LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=7,
-        num_leaves=31,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        verbose=-1,
-    )
-    lgb_model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
-    )
-    models["lightgbm"] = lgb_model
-    val_preds["lightgbm"] = lgb_model.predict(X_val)
+    for model_name, model in base_models.items():
+        print(f"    Training {model_name}...")
 
-    print("    Training XGBoost...")
-    xgb_model = xgb.XGBRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=7,
-        min_child_weight=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        verbosity=0,
-        early_stopping_rounds=50,
-    )
-    xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-    models["xgboost"] = xgb_model
-    val_preds["xgboost"] = xgb_model.predict(X_val)
+        try:
+            if model_name == "lightgbm":
+                import lightgbm as lgb
+                model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[lgb.early_stopping(50, verbose=False)],
+                )
+            elif model_name == "xgboost":
+                model.set_params(early_stopping_rounds=50)
+                model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False,
+                )
+            elif model_name == "catboost":
+                model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=(X_val, y_val),
+                    use_best_model=True,
+                    early_stopping_rounds=50,
+                )
+            else:
+                model.fit(X_train, y_train)
 
-    print("    Training CatBoost...")
-    cat_model = CatBoostRegressor(
-        iterations=500,
-        learning_rate=0.05,
-        depth=7,
-        l2_leaf_reg=3,
-        random_seed=42,
-        verbose=False,
-        early_stopping_rounds=50,
-    )
-    cat_model.fit(X_train, y_train, eval_set=(X_val, y_val), use_best_model=True)
-    models["catboost"] = cat_model
-    val_preds["catboost"] = cat_model.predict(X_val)
+            trained_models[model_name] = model
+            val_preds[model_name] = model.predict(X_val)
 
-    return {"models": models, "val_preds": val_preds}
+        except Exception as e:
+            print(f"      [WARN] {model_name} failed: {e}")
+            continue
+
+    return {"models": trained_models, "val_preds": val_preds}
 
 
 def train_neural_model(
@@ -337,22 +184,47 @@ def train_neural_model(
     X_val_seq: np.ndarray,
     y_val_seq: np.ndarray,
     n_features: int,
-    model_type: str = "lstm",
+    model_type: str = "deep_lstm",
 ) -> Tuple[Optional[pl.LightningModule], Optional[np.ndarray]]:
-    train_dataset = TimeSeriesDataset(X_train_seq, y_train_seq)
-    val_dataset = TimeSeriesDataset(X_val_seq, y_val_seq)
+    """Train advanced neural model."""
+    train_dataset = TimeSeriesDataset(
+        torch.FloatTensor(X_train_seq), torch.FloatTensor(y_train_seq)
+    )
+    val_dataset = TimeSeriesDataset(
+        torch.FloatTensor(X_val_seq), torch.FloatTensor(y_val_seq)
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers=0)
 
-    if model_type == "lstm":
-        print("    Training LSTM...")
-        model = LSTMRegressor(n_features=n_features)
-    elif model_type == "tcn":
-        print("    Training TCN...")
-        model = TCNRegressor(n_features=n_features)
+    if model_type == "deep_lstm":
+        print("    Training DeepResidualLSTM...")
+        model = DeepResidualLSTM(
+            n_features=n_features,
+            hidden_sizes=[128, 128, 64],
+            dropout=0.3,
+            learning_rate=0.001,
+            use_attention=True,
+        )
+    elif model_type == "advanced_tcn":
+        print("    Training AdvancedTCN...")
+        model = AdvancedTCN(
+            n_features=n_features,
+            num_channels=[64, 128, 128, 64],
+            kernel_size=3,
+            dropout=0.3,
+            learning_rate=0.001,
+            use_attention=True,
+        )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=10,
+        mode="min",
+        verbose=False,
+    )
 
     trainer = pl.Trainer(
         max_epochs=50,
@@ -362,44 +234,28 @@ def train_neural_model(
         enable_checkpointing=False,
         enable_progress_bar=False,
         enable_model_summary=False,
+        callbacks=[early_stop],
     )
+
     trainer.fit(model, train_loader, val_loader)
 
     model.eval()
-    val_preds_list: List[np.ndarray] = []
+    val_preds_list = []
     with torch.no_grad():
         for batch_X, _ in val_loader:
             preds = model(batch_X)
             val_preds_list.append(preds.cpu().numpy())
+
     val_preds = np.concatenate(val_preds_list)
 
     return model, val_preds
 
 
-def train_ensemble_blender(
-    val_preds_dict: Dict[str, np.ndarray],
-    y_val: np.ndarray,
-) -> CatBoostRegressor:
-    stacked_preds = np.column_stack(list(val_preds_dict.values()))
-    print(f"    Training ensemble blender with {stacked_preds.shape[1]} base models...")
-
-    blender = CatBoostRegressor(
-        iterations=150,
-        depth=4,
-        learning_rate=0.1,
-        random_seed=42,
-        verbose=False,
-    )
-    blender.fit(stacked_preds, y_val)
-    return blender
-
-
-# ======================================================================
-# MASTER TRAINING LOOP
-# ======================================================================
-
-
-def train_ticker_models(ticker: str, train_neural: bool = TRAIN_NEURAL) -> Optional[Dict]:
+def train_ticker_models(
+    ticker: str,
+    train_neural: bool = TRAIN_NEURAL,
+) -> Optional[Dict]:
+    """Training pipeline for a single ticker."""
     print("\n" + "=" * 80)
     print(f"Training models for {ticker}")
     print("=" * 80)
@@ -421,69 +277,109 @@ def train_ticker_models(ticker: str, train_neural: bool = TRAIN_NEURAL) -> Optio
         print(f"[SKIP] Missing targets: {missing_targets}")
         return None
 
-    # Separate features and targets
-    feature_cols = [c for c in df.columns if c not in TARGETS]
-    X = df[feature_cols].copy()
+    if FILTER_BAD_DATA:
+        original_len = len(df)
+        df = filter_bad_data(
+            df,
+            price_col="close",
+            volume_col="volume" if "volume" in df.columns else None,
+            min_volume_percentile=MIN_VOLUME_PERCENTILE,
+            max_price_jump_pct=MAX_PRICE_JUMP,
+        )
+        filtered_count = original_len - len(df)
+        if filtered_count > 0:
+            print(f"  Filtered {filtered_count} bad data points ({filtered_count/original_len*100:.1f}%)")
 
-    # Time-based split for features
-    X_train, X_val, X_test = time_based_split(X)
-    print(f"Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
+    if BUILD_ALPHA_FEATURES:
+        print("  Building alpha features...")
+        df = build_alpha_features(
+            df,
+            market_returns=None,
+            include_interactions=INCLUDE_INTERACTIONS,
+        )
 
-    # Drop non-numeric columns (e.g., 'ticker') before scaling
-    non_numeric_cols = X_train.select_dtypes(include=["object", "string"]).columns
-    if len(non_numeric_cols) > 0:
-        print(f"[PATCH] Dropping non-numeric columns: {list(non_numeric_cols)}")
-        X_train = X_train.drop(columns=non_numeric_cols, errors="ignore")
-        X_val = X_val.drop(columns=non_numeric_cols, errors="ignore")
-        X_test = X_test.drop(columns=non_numeric_cols, errors="ignore")
+    print(f"Loaded {len(df)} samples with {len(df.columns)} columns")
 
-    # Align columns across splits
-    X_val = X_val.reindex(columns=X_train.columns, fill_value=0)
-    X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
-
-    # Scale numeric features
-    scaler = StandardScaler()
-    X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(X_train),
-        columns=X_train.columns,
-        index=X_train.index,
-    )
-    X_val_scaled = pd.DataFrame(
-        scaler.transform(X_val),
-        columns=X_val.columns,
-        index=X_val.index,
-    )
-    X_test_scaled = pd.DataFrame(
-        scaler.transform(X_test),
-        columns=X_test.columns,
-        index=X_test.index,
-    )
-
-    ticker_artifacts: Dict[str, any] = {
+    ticker_artifacts = {
         "ticker": ticker,
-        "feature_columns": list(X_train.columns),
-        "scaler": scaler,
         "horizons": {},
     }
 
-    # Train per target horizon
     for target in TARGETS:
+        horizon_short = target.replace("target_", "").replace("_return", "")
         print("\n" + "-" * 80)
-        print(f"Target: {target}")
+        print(f"Target: {target} ({horizon_short})")
         print("-" * 80)
 
-        y = df[target]
-        y_train, y_val, y_test = time_based_split(y)
+        print("  Creating horizon-specific features...")
+        df_horizon = create_horizon_specific_features(df, horizon_short)
 
-        horizon_artifacts: Dict[str, any] = {
+        feature_cols = [
+            c for c in df_horizon.columns if c not in TARGETS and c != "ticker"
+        ]
+
+        X_raw = df_horizon[feature_cols]
+        y_raw = df_horizon[target]
+
+        valid_idx = X_raw.dropna().index.intersection(y_raw.dropna().index)
+
+        if len(valid_idx) < 100:
+            print(f"  [SKIP] Insufficient valid data: {len(valid_idx)} samples")
+            continue
+
+        X = X_raw.loc[valid_idx]
+        y = y_raw.loc[valid_idx]
+
+        print(f"  Valid samples: {len(X)}")
+
+        print("  Preprocessing targets...")
+        y_processed, transform_params = preprocess_targets(
+            y,
+            method=TARGET_TRANSFORM,
+            normalize=NORMALIZE_TARGETS,
+            denoise=USE_KALMAN_FILTER,
+            denoise_window=5,
+        )
+
+        n = len(X)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+
+        X_train = X.iloc[:train_end]
+        y_train = y_processed.iloc[:train_end]
+        X_val = X.iloc[train_end:val_end]
+        y_val = y_processed.iloc[train_end:val_end]
+        X_test = X.iloc[val_end:]
+        y_test = y_processed.iloc[val_end:]
+        y_test_original = y.iloc[val_end:]
+
+        print(f"  Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
+
+        print("  Scaling features...")
+        X_train_scaled, scaler = robust_scale_features(X_train)
+        X_val_scaled = pd.DataFrame(
+            scaler.transform(X_val),
+            columns=X_val.columns,
+            index=X_val.index,
+        )
+        X_test_scaled = pd.DataFrame(
+            scaler.transform(X_test),
+            columns=X_test.columns,
+            index=X_test.index,
+        )
+
+        horizon_artifacts = {
             "base_models": {},
             "val_predictions": {},
             "test_predictions": {},
             "metrics": {},
             "has_neural": False,
+            "feature_columns": list(X_train.columns),
+            "scaler": scaler,
+            "transform_params": transform_params,
         }
 
-        # Gradient boosting models
+        print("  Training base models...")
         gb_results = train_gradient_boosting_models(
             X_train_scaled, y_train, X_val_scaled, y_val
         )
@@ -492,16 +388,17 @@ def train_ticker_models(ticker: str, train_neural: bool = TRAIN_NEURAL) -> Optio
         horizon_artifacts["val_predictions"].update(gb_results["val_preds"])
 
         for model_name, model in gb_results["models"].items():
-            test_pred = model.predict(X_test_scaled)
+            test_pred_scaled = model.predict(X_test_scaled)
+            test_pred = inverse_preprocess_targets(test_pred_scaled, transform_params)
+
             horizon_artifacts["test_predictions"][model_name] = test_pred
 
-            metrics = compute_metrics(y_test, test_pred)
+            metrics = compute_metrics(y_test_original.values, test_pred)
             horizon_artifacts["metrics"][model_name] = metrics
             print_metrics(metrics, model_name, prefix="    ")
 
-        # Neural models (LSTM / TCN) trained only for subset of tickers
         if train_neural and ticker in NEURAL_TICKERS:
-            print(f"\n  Neural models (lookback={LOOKBACK_WINDOW})")
+            print(f"\n  Neural models (lookback={LOOKBACK_WINDOW}):")
 
             X_train_seq, y_train_seq = create_sequence_dataset(
                 X_train_scaled, y_train, LOOKBACK_WINDOW
@@ -515,107 +412,97 @@ def train_ticker_models(ticker: str, train_neural: bool = TRAIN_NEURAL) -> Optio
 
             n_features = X_train_scaled.shape[1]
 
-            # LSTM
-            lstm_model, lstm_val_preds = train_neural_model(
-                X_train_seq,
-                y_train_seq,
-                X_val_seq,
-                y_val_seq,
-                n_features,
-                model_type="lstm",
-            )
-            if lstm_model is not None:
-                horizon_artifacts["base_models"]["lstm"] = lstm_model
-                horizon_artifacts["val_predictions"]["lstm"] = lstm_val_preds
-
-                lstm_model.eval()
-                lstm_test_list: List[np.ndarray] = []
-                with torch.no_grad():
-                    test_loader = DataLoader(
-                        TimeSeriesDataset(X_test_seq, y_test_seq),
-                        batch_size=64,
-                        shuffle=False,
-                        num_workers=0,
+            for neural_type in ["deep_lstm", "advanced_tcn"]:
+                try:
+                    model, val_preds = train_neural_model(
+                        X_train_seq,
+                        y_train_seq,
+                        X_val_seq,
+                        y_val_seq,
+                        n_features,
+                        model_type=neural_type,
                     )
-                    for batch_X, _ in test_loader:
-                        preds = lstm_model(batch_X)
-                        lstm_test_list.append(preds.cpu().numpy())
-                lstm_test_preds = np.concatenate(lstm_test_list)
-                horizon_artifacts["test_predictions"]["lstm"] = lstm_test_preds
 
-                lstm_metrics = compute_metrics(y_test_seq, lstm_test_preds)
-                horizon_artifacts["metrics"]["lstm"] = lstm_metrics
-                print_metrics(lstm_metrics, "LSTM", prefix="    ")
+                    if model is not None:
+                        horizon_artifacts["base_models"][neural_type] = model
+                        horizon_artifacts["val_predictions"][neural_type] = val_preds
 
-            # TCN
-            tcn_model, tcn_val_preds = train_neural_model(
-                X_train_seq,
-                y_train_seq,
-                X_val_seq,
-                y_val_seq,
-                n_features,
-                model_type="tcn",
-            )
-            if tcn_model is not None:
-                horizon_artifacts["base_models"]["tcn"] = tcn_model
-                horizon_artifacts["val_predictions"]["tcn"] = tcn_val_preds
+                        model.eval()
+                        test_loader = DataLoader(
+                            TimeSeriesDataset(
+                                torch.FloatTensor(X_test_seq),
+                                torch.FloatTensor(y_test_seq),
+                            ),
+                            batch_size=64,
+                            shuffle=False,
+                            num_workers=0,
+                        )
 
-                tcn_model.eval()
-                tcn_test_list: List[np.ndarray] = []
-                with torch.no_grad():
-                    test_loader = DataLoader(
-                        TimeSeriesDataset(X_test_seq, y_test_seq),
-                        batch_size=64,
-                        shuffle=False,
-                        num_workers=0,
-                    )
-                    for batch_X, _ in test_loader:
-                        preds = tcn_model(batch_X)
-                        tcn_test_list.append(preds.cpu().numpy())
-                tcn_test_preds = np.concatenate(tcn_test_list)
-                horizon_artifacts["test_predictions"]["tcn"] = tcn_test_preds
+                        test_preds_list = []
+                        with torch.no_grad():
+                            for batch_X, _ in test_loader:
+                                preds = model(batch_X)
+                                test_preds_list.append(preds.cpu().numpy())
 
-                tcn_metrics = compute_metrics(y_test_seq, tcn_test_preds)
-                horizon_artifacts["metrics"]["tcn"] = tcn_metrics
-                print_metrics(tcn_metrics, "TCN", prefix="    ")
+                        test_pred_scaled = np.concatenate(test_preds_list)
+                        test_pred = inverse_preprocess_targets(
+                            test_pred_scaled, transform_params
+                        )
+
+                        horizon_artifacts["test_predictions"][neural_type] = test_pred
+
+                        y_test_seq_original = y_test_original.values[LOOKBACK_WINDOW - 1 :]
+
+                        metrics = compute_metrics(y_test_seq_original, test_pred)
+                        horizon_artifacts["metrics"][neural_type] = metrics
+                        print_metrics(metrics, neural_type, prefix="    ")
+
+                except Exception as e:
+                    print(f"    [WARN] {neural_type} failed: {e}")
 
             horizon_artifacts["lookback_window"] = LOOKBACK_WINDOW
             horizon_artifacts["has_neural"] = True
 
-        # Ensemble blender (only over gradient boosting models to keep shapes aligned)
-        print("\n  Ensemble:")
+        if USE_STACKING and len(horizon_artifacts["base_models"]) > 2:
+            print("\n  Training stacking ensemble...")
 
-        blender_val_preds = {
-            name: preds
-            for name, preds in horizon_artifacts["val_predictions"].items()
-            if name in ["lightgbm", "xgboost", "catboost"]
-        }
-        blender_test_preds = {
-            name: preds
-            for name, preds in horizon_artifacts["test_predictions"].items()
-            if name in ["lightgbm", "xgboost", "catboost"]
-        }
+            try:
+                stacking_models = {
+                    k: v
+                    for k, v in horizon_artifacts["base_models"].items()
+                    if k not in ["deep_lstm", "advanced_tcn", "transformer", "lstm", "tcn"]
+                }
 
-        if len(blender_val_preds) == 0:
-            print("    [WARN] No gradient boosting models available for ensemble.")
-            ensemble_test_pred = np.zeros_like(y_test.values)
-        else:
-            y_val_arr = y_val.values if hasattr(y_val, "values") else np.asarray(y_val)
-            blender = train_ensemble_blender(blender_val_preds, y_val_arr)
-            horizon_artifacts["blender"] = blender
+                ensemble = train_stacking_ensemble(
+                    X_train_scaled,
+                    y_train,
+                    stacking_models,
+                    n_folds=STACKING_FOLDS,
+                    use_meta_features=USE_META_FEATURES,
+                )
 
-            stacked_test = np.column_stack(list(blender_test_preds.values()))
-            ensemble_test_pred = blender.predict(stacked_test)
+                horizon_artifacts["stacking_ensemble"] = ensemble
 
-        horizon_artifacts["test_predictions"]["ensemble"] = ensemble_test_pred
-        y_test_arr = y_test.values if hasattr(y_test, "values") else np.asarray(y_test)
-        ensemble_metrics = compute_metrics(y_test_arr, ensemble_test_pred)
-        horizon_artifacts["metrics"]["ensemble"] = ensemble_metrics
-        print_metrics(ensemble_metrics, "Ensemble", prefix="    ")
+                ensemble_test_pred_scaled = predict_with_ensemble(
+                    X_test_scaled, ensemble, return_components=False
+                )
+                ensemble_test_pred = inverse_preprocess_targets(
+                    ensemble_test_pred_scaled, transform_params
+                )
+
+                horizon_artifacts["test_predictions"]["stacking_ensemble"] = (
+                    ensemble_test_pred
+                )
+
+                metrics = compute_metrics(y_test_original.values, ensemble_test_pred)
+                horizon_artifacts["metrics"]["stacking_ensemble"] = metrics
+                print_metrics(metrics, "Stacking Ensemble", prefix="    ")
+
+            except Exception as e:
+                print(f"    [WARN] Stacking ensemble failed: {e}")
 
         ticker_artifacts["horizons"][target] = horizon_artifacts
 
-    # Save per-ticker artifacts
     artifact_path = MODELS_DIR / f"{ticker}_numeric_ensemble.pkl"
     joblib.dump(ticker_artifacts, artifact_path)
     print(f"\n[SAVED] {artifact_path}")
@@ -638,11 +525,15 @@ def main() -> None:
     if TRAIN_NEURAL:
         print(f"  Neural tickers: {len(NEURAL_TICKERS)} / {len(TICKERS)}")
         print(f"  Lookback window: {LOOKBACK_WINDOW}")
+    print(f"  Filter bad data: {FILTER_BAD_DATA}")
+    print(f"  Build alpha features: {BUILD_ALPHA_FEATURES}")
+    print(f"  Use stacking: {USE_STACKING}")
+    print(f"  Target transform: {TARGET_TRANSFORM}")
+    print(f"  Normalize targets: {NORMALIZE_TARGETS}")
     print(f"  Features directory: {FEATURES_DIR}")
-    print(f"  Output directory:   {MODELS_DIR}")
+    print(f"  Output directory: {MODELS_DIR}")
 
-    # Detect which tickers have feature files
-    available_tickers: List[str] = []
+    available_tickers = []
     for ticker in TICKERS:
         if (FEATURES_DIR / f"{ticker}_1h.parquet").exists():
             available_tickers.append(ticker)
@@ -651,38 +542,41 @@ def main() -> None:
     if available_tickers:
         print(f"  {', '.join(available_tickers)}")
 
-    # Train all available tickers
-    results: Dict[str, Dict] = {}
+    results = {}
     for ticker in available_tickers:
         train_neural_for_ticker = TRAIN_NEURAL and ticker in NEURAL_TICKERS
         result = train_ticker_models(ticker, train_neural=train_neural_for_ticker)
         if result is not None:
             results[ticker] = result
 
-    # Final summary
     print("\n" + "=" * 80)
     print("FINAL SUMMARY")
     print("=" * 80)
 
-    summary_rows: List[Dict[str, float]] = []
+    summary_rows = []
     for ticker, artifacts in results.items():
-        row: Dict[str, float] = {"Ticker": ticker}
+        row = {"Ticker": ticker}
+
         for target in TARGETS:
+            if target not in artifacts["horizons"]:
+                continue
+
             horizon_short = target.replace("target_", "").replace("_return", "")
-            metrics = artifacts["horizons"][target]["metrics"].get("ensemble", {})
+            metrics = artifacts["horizons"][target]["metrics"].get(
+                "stacking_ensemble",
+                artifacts["horizons"][target]["metrics"].get("catboost", {}),
+            )
 
             row[f"{horizon_short}_MAE"] = metrics.get("mae", np.nan)
             row[f"{horizon_short}_RMSE"] = metrics.get("rmse", np.nan)
             row[f"{horizon_short}_R2"] = metrics.get("r2", np.nan)
-            row[f"{horizon_short}_DirAcc"] = metrics.get(
-                "directional_accuracy", np.nan
-            )
+            row[f"{horizon_short}_DirAcc"] = metrics.get("directional_accuracy", np.nan)
 
         summary_rows.append(row)
 
     summary_df = pd.DataFrame(summary_rows)
 
-    print("\nEnsemble Performance Summary:")
+    print("\nBest Model Performance Summary:")
     if not summary_df.empty:
         print(summary_df.to_string(index=False))
     else:

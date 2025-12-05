@@ -205,7 +205,7 @@ class DeepResidualLSTM(pl.LightningModule):
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=False
+            optimizer, mode="min", factor=0.5, patience=5
         )
 
         return {
@@ -400,7 +400,7 @@ class AdvancedTCN(pl.LightningModule):
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=False
+            optimizer, mode="min", factor=0.5, patience=5
         )
 
         return {
@@ -504,7 +504,7 @@ class TransformerRegressor(pl.LightningModule):
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=False
+            optimizer, mode="min", factor=0.5, patience=5
         )
 
         return {

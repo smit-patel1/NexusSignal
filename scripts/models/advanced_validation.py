@@ -250,7 +250,7 @@ def compute_fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     ic = np.corrcoef(y_true, y_pred)[0, 1] if len(y_true) > 1 else 0.0
 
     # Mean absolute percentage error (handle zeros)
-    mape = np.mean(np.abs((y_true - y_pred) / np.abs(y_true).clip(lower=1e-10))) * 100
+    mape = np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-10, None))) * 100
 
     return {
         "mae": mae,

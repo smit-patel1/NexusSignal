@@ -1,175 +1,176 @@
 """
-Numeric model inference for NexusSignal backend.
+Inference API for trained numeric ensemble models.
 
-Provides simple interface to load trained ensemble models and generate predictions.
+Functions:
+- load_numeric_model(): Load trained model artifacts
+- predict_numeric_returns(): Generate return predictions
+- get_model_info(): Get model metadata
+- list_available_models(): List all trained models
 """
 
 from pathlib import Path
 from typing import Dict, Optional, Union
 import warnings
-warnings.filterwarnings('ignore')
 
-import numpy as np
-import pandas as pd
 import joblib
-import torch
+import pandas as pd
+import numpy as np
 
+from scripts.models.advanced_preprocessing import inverse_preprocess_targets
+from scripts.models.advanced_ensemble import predict_with_ensemble
 
-# Model artifact directory
 MODELS_DIR = Path(__file__).parent.parent.parent.parent / "models" / "numeric"
 
-# Cache for loaded models
-_MODEL_CACHE: Dict[str, Dict] = {}
+_MODEL_CACHE = {}
 
 
 def load_numeric_model(ticker: str, force_reload: bool = False) -> Optional[Dict]:
     """
-    Load trained numeric ensemble model for a ticker.
+    Load trained ensemble artifacts for a ticker.
 
     Args:
         ticker: Stock ticker symbol
-        force_reload: If True, reload from disk even if cached
+        force_reload: Force reload from disk (ignore cache)
 
     Returns:
-        Dictionary containing all model artifacts, or None if not found
-
-    Raises:
-        FileNotFoundError: If model file doesn't exist
+        Model artifacts dict or None if not found
     """
-    # Check cache
-    if ticker in _MODEL_CACHE and not force_reload:
+    if not force_reload and ticker in _MODEL_CACHE:
         return _MODEL_CACHE[ticker]
 
-    # Load from disk
     model_path = MODELS_DIR / f"{ticker}_numeric_ensemble.pkl"
 
     if not model_path.exists():
-        raise FileNotFoundError(f"No trained model found for {ticker} at {model_path}")
+        warnings.warn(f"Model not found for {ticker}: {model_path}")
+        return None
 
-    artifact = joblib.load(model_path)
-
-    # Cache it
-    _MODEL_CACHE[ticker] = artifact
-
-    return artifact
+    try:
+        artifacts = joblib.load(model_path)
+        _MODEL_CACHE[ticker] = artifacts
+        return artifacts
+    except Exception as e:
+        warnings.warn(f"Failed to load model for {ticker}: {e}")
+        return None
 
 
 def predict_numeric_returns(
     ticker: str,
     feature_row: Union[pd.Series, pd.DataFrame],
-    use_ensemble: bool = True
+    use_ensemble: bool = True,
 ) -> Dict[str, Union[float, Dict]]:
     """
-    Predict future returns for a ticker using trained ensemble.
+    Predict future returns using trained ensemble.
 
     Args:
         ticker: Stock ticker symbol
-        feature_row: Single row of features (pd.Series or 1-row DataFrame)
-        use_ensemble: If True, use ensemble blender; if False, average base models
+        feature_row: Single row of features (Series or 1-row DataFrame)
+        use_ensemble: Use stacking ensemble (True) or best single model (False)
 
     Returns:
-        Dictionary with predictions:
         {
             "target_1h_return": float,
             "target_4h_return": float,
             "target_24h_return": float,
             "components": {
-                "lightgbm": {"1h": float, "4h": float, "24h": float},
-                "xgboost": {...},
-                "catboost": {...},
-                "lstm": {...} or None,
-                "tcn": {...} or None,
-                "ensemble": {...}
+                "model_name": {"1h": float, "4h": float, "24h": float},
+                ...
             }
         }
-
-    Raises:
-        FileNotFoundError: If model doesn't exist
-        ValueError: If features don't match training
     """
-    # Load model
-    artifact = load_numeric_model(ticker)
+    artifacts = load_numeric_model(ticker)
 
-    # Convert to DataFrame if Series
+    if artifacts is None:
+        raise ValueError(f"Model not found for {ticker}")
+
     if isinstance(feature_row, pd.Series):
         feature_row = feature_row.to_frame().T
 
-    # Validate features
-    expected_features = artifact['feature_columns']
-
-    # Check for missing features
-    missing_features = set(expected_features) - set(feature_row.columns)
-    if missing_features:
-        raise ValueError(f"Missing features: {missing_features}")
-
-    # Reorder to match training
-    feature_row = feature_row[expected_features]
-
-    # Scale features
-    scaler = artifact['scaler']
-    feature_scaled = scaler.transform(feature_row)
-    feature_scaled_df = pd.DataFrame(
-        feature_scaled,
-        columns=expected_features
-    )
-
-    # Prepare output
     predictions = {}
     components = {}
 
-    # For each horizon
-    for target, horizon_artifacts in artifact['horizons'].items():
-        horizon_short = target.replace('target_', '').replace('_return', '')
+    for target_name, horizon_artifacts in artifacts["horizons"].items():
+        horizon_short = target_name.replace("target_", "").replace("_return", "")
 
-        # Get base model predictions
-        base_preds = {}
+        feature_columns = horizon_artifacts["feature_columns"]
+        missing_cols = [c for c in feature_columns if c not in feature_row.columns]
 
-        # Gradient boosting models
-        for model_name in ['lightgbm', 'xgboost', 'catboost']:
-            if model_name in horizon_artifacts['base_models']:
-                model = horizon_artifacts['base_models'][model_name]
-                pred = model.predict(feature_scaled_df)[0]
-                base_preds[model_name] = pred
+        if missing_cols:
+            warnings.warn(
+                f"Missing features for {ticker} {horizon_short}: {missing_cols[:5]}"
+            )
+            predictions[target_name] = np.nan
+            continue
 
-                if model_name not in components:
-                    components[model_name] = {}
-                components[model_name][horizon_short] = float(pred)
+        features_aligned = feature_row[feature_columns]
 
-        # Neural models (if available)
-        # Note: For neural models, we'd need the full lookback window sequence
-        # For now, we'll skip them in inference and rely on gradient boosting models
-        # This can be extended in future phases when we have streaming context
+        scaler = horizon_artifacts["scaler"]
+        features_scaled = pd.DataFrame(
+            scaler.transform(features_aligned),
+            columns=feature_columns,
+            index=features_aligned.index,
+        )
 
-        if horizon_artifacts.get('has_neural', False):
-            # Placeholder for LSTM/TCN
-            # In production, you'd need to maintain a rolling window buffer
-            components['lstm'] = None
-            components['tcn'] = None
+        transform_params = horizon_artifacts["transform_params"]
 
-        # Ensemble prediction
-        if use_ensemble and 'blender' in horizon_artifacts:
-            blender = horizon_artifacts['blender']
+        if use_ensemble and "stacking_ensemble" in horizon_artifacts:
+            ensemble = horizon_artifacts["stacking_ensemble"]
 
-            # Stack base predictions
-            stacked_preds = np.array([base_preds[k] for k in sorted(base_preds.keys())]).reshape(1, -1)
+            try:
+                pred_scaled = predict_with_ensemble(
+                    features_scaled, ensemble, return_components=False
+                )
+                pred = inverse_preprocess_targets(pred_scaled, transform_params)
+                predictions[target_name] = float(pred[0])
 
-            ensemble_pred = blender.predict(stacked_preds)[0]
+                _, base_preds = predict_with_ensemble(
+                    features_scaled, ensemble, return_components=True
+                )
+
+                for model_name in base_preds.columns:
+                    if model_name not in components:
+                        components[model_name] = {}
+                    pred_scaled_comp = base_preds[model_name].values
+                    pred_comp = inverse_preprocess_targets(
+                        pred_scaled_comp, transform_params
+                    )
+                    components[model_name][horizon_short] = float(pred_comp[0])
+
+            except Exception as e:
+                warnings.warn(f"Ensemble prediction failed for {horizon_short}: {e}")
+                predictions[target_name] = np.nan
+
         else:
-            # Simple average as fallback
-            ensemble_pred = np.mean(list(base_preds.values()))
+            best_model_name = None
+            best_metric = -np.inf
 
-        predictions[target] = float(ensemble_pred)
+            for model_name, metrics in horizon_artifacts["metrics"].items():
+                if model_name == "stacking_ensemble":
+                    continue
+                r2 = metrics.get("r2", -np.inf)
+                if r2 > best_metric:
+                    best_metric = r2
+                    best_model_name = model_name
 
-        if 'ensemble' not in components:
-            components['ensemble'] = {}
-        components['ensemble'][horizon_short] = float(ensemble_pred)
+            if best_model_name and best_model_name in horizon_artifacts["base_models"]:
+                model = horizon_artifacts["base_models"][best_model_name]
+                pred_scaled = model.predict(features_scaled)
+                pred = inverse_preprocess_targets(pred_scaled, transform_params)
+                predictions[target_name] = float(pred[0])
 
-    return {
-        'target_1h_return': predictions.get('target_1h_return'),
-        'target_4h_return': predictions.get('target_4h_return'),
-        'target_24h_return': predictions.get('target_24h_return'),
-        'components': components
+                if best_model_name not in components:
+                    components[best_model_name] = {}
+                components[best_model_name][horizon_short] = float(pred[0])
+            else:
+                predictions[target_name] = np.nan
+
+    result = {
+        "target_1h_return": predictions.get("target_1h_return", np.nan),
+        "target_4h_return": predictions.get("target_4h_return", np.nan),
+        "target_24h_return": predictions.get("target_24h_return", np.nan),
+        "components": components,
     }
+
+    return result
 
 
 def get_model_info(ticker: str) -> Dict[str, any]:
@@ -180,62 +181,41 @@ def get_model_info(ticker: str) -> Dict[str, any]:
         ticker: Stock ticker symbol
 
     Returns:
-        Dictionary with model information:
         {
-            'ticker': str,
-            'feature_count': int,
-            'feature_columns': list,
-            'has_neural': bool,
-            'horizons': list,
-            'base_models': list
+            "ticker": str,
+            "horizons": list,
+            "num_features": int,
+            "has_neural": bool,
+            "base_models": list,
+        }
+    """
+    artifacts = load_numeric_model(ticker)
+
+    if artifacts is None:
+        return {}
+
+    horizons_info = {}
+
+    for target_name, horizon_artifacts in artifacts["horizons"].items():
+        horizon_short = target_name.replace("target_", "").replace("_return", "")
+
+        horizons_info[horizon_short] = {
+            "num_features": len(horizon_artifacts["feature_columns"]),
+            "has_neural": horizon_artifacts.get("has_neural", False),
+            "base_models": list(horizon_artifacts["base_models"].keys()),
+            "has_stacking": "stacking_ensemble" in horizon_artifacts,
         }
 
-    Raises:
-        FileNotFoundError: If model doesn't exist
-    """
-    artifact = load_numeric_model(ticker)
-
-    # Collect info
-    horizons = list(artifact['horizons'].keys())
-    base_models = set()
-
-    for horizon_artifacts in artifact['horizons'].values():
-        base_models.update(horizon_artifacts['base_models'].keys())
-
-    has_neural = any(
-        horizon_artifacts.get('has_neural', False)
-        for horizon_artifacts in artifact['horizons'].values()
-    )
-
     return {
-        'ticker': ticker,
-        'feature_count': len(artifact['feature_columns']),
-        'feature_columns': artifact['feature_columns'],
-        'has_neural': has_neural,
-        'horizons': horizons,
-        'base_models': sorted(list(base_models)),
-        'lookback_window': artifact['horizons'][horizons[0]].get('lookback_window') if has_neural else None
+        "ticker": ticker,
+        "horizons": list(horizons_info.keys()),
+        "horizon_details": horizons_info,
     }
-
-
-def clear_model_cache(ticker: Optional[str] = None) -> None:
-    """
-    Clear cached models.
-
-    Args:
-        ticker: If provided, clear only this ticker; otherwise clear all
-    """
-    global _MODEL_CACHE
-
-    if ticker is None:
-        _MODEL_CACHE.clear()
-    elif ticker in _MODEL_CACHE:
-        del _MODEL_CACHE[ticker]
 
 
 def list_available_models() -> list:
     """
-    List all available trained models.
+    List all trained models.
 
     Returns:
         List of ticker symbols with trained models
@@ -243,7 +223,13 @@ def list_available_models() -> list:
     if not MODELS_DIR.exists():
         return []
 
-    model_files = MODELS_DIR.glob("*_numeric_ensemble.pkl")
-    tickers = [f.stem.replace('_numeric_ensemble', '') for f in model_files]
+    model_files = list(MODELS_DIR.glob("*_numeric_ensemble.pkl"))
+    tickers = [f.stem.replace("_numeric_ensemble", "") for f in model_files]
 
     return sorted(tickers)
+
+
+def clear_model_cache() -> None:
+    """Clear the model cache."""
+    global _MODEL_CACHE
+    _MODEL_CACHE = {}

@@ -81,6 +81,15 @@ def create_diverse_base_models() -> Dict[str, any]:
 
     return models
 
+def stack_prediction_dicts(pred_dicts: List[Dict[str, float]]) -> Tuple[np.ndarray, List[str]]:
+    """
+    Convert list of prediction dicts into a consistent 2D array.
+    Keys are sorted alphabetically to guarantee identical column order.
+    """
+    model_names = sorted(pred_dicts[0].keys())
+    matrix = np.column_stack([[d[m] for d in pred_dicts] for m in model_names])
+    return matrix, model_names
+
 
 def cross_validated_predictions(
     X: pd.DataFrame,
@@ -174,7 +183,7 @@ def cross_validated_predictions(
 
 
 def compute_meta_features(
-    base_predictions: pd.DataFrame, y_true: pd.Series
+    base_predictions: pd.DataFrame, y_true: Optional[pd.Series] = None
 ) -> pd.DataFrame:
     """
     Compute meta-features from base model predictions.
@@ -226,7 +235,8 @@ def compute_meta_features(
 
         if pairwise_diffs:
             meta_features["avg_pairwise_diff"] = pd.DataFrame(pairwise_diffs).T.mean(axis=1)
-
+    
+    meta_features = meta_features.reindex(sorted(meta_features.columns), axis=1)
     return meta_features
 
 
@@ -268,6 +278,9 @@ def train_stacking_ensemble(
     # Remove rows with NaN (from failed models)
     valid_idx = meta_features.dropna().index
     meta_features_clean = meta_features.loc[valid_idx]
+    # Ensure deterministic column order for meta-learner
+    meta_features_clean = meta_features_clean.reindex(sorted(meta_features_clean.columns), axis=1)
+
     y_clean = y.loc[valid_idx]
 
     # Train meta-learner
@@ -282,6 +295,8 @@ def train_stacking_ensemble(
 
     print(f"  Training meta-learner on {len(meta_features_clean)} samples...")
     meta_learner.fit(meta_features_clean, y_clean)
+    # Save consistent ordering for inference stage
+    ordered_feature_names = list(meta_features_clean.columns)
 
     # Train final base models on full data
     print("  Training final base models on full data...")
@@ -297,6 +312,7 @@ def train_stacking_ensemble(
             warnings.warn(f"Failed to train final {model_name}: {e}")
 
     ensemble = {
+        "feature_order": ordered_feature_names,
         "base_models": final_base_models,
         "meta_learner": meta_learner,
         "fold_models": fold_models,
@@ -341,6 +357,9 @@ def predict_with_ensemble(
         meta_input = compute_meta_features(base_predictions, y_true=None)
     else:
         meta_input = base_predictions
+
+    if "feature_order" in ensemble:
+        meta_input = meta_input.reindex(ensemble["feature_order"], axis=1)
 
     # Meta-learner prediction
     ensemble_pred = meta_learner.predict(meta_input)
