@@ -321,14 +321,32 @@ def train_ticker_models(
         X_raw = df_horizon[feature_cols]
         y_raw = df_horizon[target]
 
-        valid_idx = X_raw.dropna().index.intersection(y_raw.dropna().index)
+        # Drop rows where target is NaN
+        valid_target_idx = y_raw.dropna().index
+
+        # Drop rows where ALL features are NaN (keep rows with some valid features)
+        valid_feature_idx = X_raw.dropna(how='all').index
+
+        # Get intersection
+        valid_idx = valid_target_idx.intersection(valid_feature_idx)
 
         if len(valid_idx) < 100:
-            print(f"  [SKIP] Insufficient valid data: {len(valid_idx)} samples")
+            print(f"  [SKIP] Insufficient valid data after target filter: {len(valid_idx)} samples")
             continue
 
-        X = X_raw.loc[valid_idx]
-        y = y_raw.loc[valid_idx]
+        # Now subset and drop only rows with NaN in any feature column
+        X_subset = X_raw.loc[valid_idx]
+        y_subset = y_raw.loc[valid_idx]
+
+        # Drop rows with NaN in any feature
+        final_valid_idx = X_subset.dropna().index
+
+        if len(final_valid_idx) < 100:
+            print(f"  [SKIP] Insufficient valid data after feature filter: {len(final_valid_idx)} samples")
+            continue
+
+        X = X_subset.loc[final_valid_idx]
+        y = y_subset.loc[final_valid_idx]
 
         print(f"  Valid samples: {len(X)}")
 
