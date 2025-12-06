@@ -124,6 +124,12 @@ def cross_validated_predictions(
         X_train = X.iloc[train_idx]
         y_train = y.iloc[train_idx]
         X_val = X.iloc[val_idx]
+        
+        # FIX: Ensure no NaN/inf values - convert to clean numpy arrays
+        X_train_arr = np.nan_to_num(X_train.values, nan=0.0, posinf=0.0, neginf=0.0)
+        y_train_arr = np.nan_to_num(y_train.values, nan=0.0, posinf=0.0, neginf=0.0)
+        X_val_arr = np.nan_to_num(X_val.values, nan=0.0, posinf=0.0, neginf=0.0)
+        y_val_arr = np.nan_to_num(y.iloc[val_idx].values, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Train each model
         for model_name, model in models.items():
@@ -139,32 +145,32 @@ def cross_validated_predictions(
                         # Early stopping for gradient boosting
                         if model_name == "lightgbm":
                             model_clone.fit(
-                                X_train,
-                                y_train,
-                                eval_set=[(X_val, y.iloc[val_idx])],
+                                X_train_arr,
+                                y_train_arr,
+                                eval_set=[(X_val_arr, y_val_arr)],
                                 callbacks=[lgb.early_stopping(50, verbose=False)],
                             )
                         elif model_name == "xgboost":
                             model_clone.set_params(early_stopping_rounds=50)
                             model_clone.fit(
-                                X_train,
-                                y_train,
-                                eval_set=[(X_val, y.iloc[val_idx])],
+                                X_train_arr,
+                                y_train_arr,
+                                eval_set=[(X_val_arr, y_val_arr)],
                                 verbose=False,
                             )
                         elif model_name == "catboost":
                             model_clone.fit(
-                                X_train,
-                                y_train,
-                                eval_set=(X_val, y.iloc[val_idx]),
+                                X_train_arr,
+                                y_train_arr,
+                                eval_set=(X_val_arr, y_val_arr),
                                 use_best_model=True,
                                 early_stopping_rounds=50,
                             )
                     else:
-                        model_clone.fit(X_train, y_train)
+                        model_clone.fit(X_train_arr, y_train_arr)
 
                     # Predict on validation set
-                    val_pred = model_clone.predict(X_val)
+                    val_pred = model_clone.predict(X_val_arr)
 
                     # Store predictions
                     if model_name not in oof_predictions.columns:
@@ -262,26 +268,32 @@ def train_stacking_ensemble(
     Returns:
         Dictionary with trained ensemble artifacts
     """
-    # FIX: Clean input data - handle NaN/inf values that may come from scaling
+    # FIX: Aggressively clean input data - handle NaN/inf values
     X_clean = X.copy()
     
-    # Replace inf with NaN first
+    # Step 1: Replace inf with NaN
     X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
     
-    # Drop columns that are entirely NaN or have very high NaN ratio
+    # Step 2: Drop columns that are entirely NaN or have high NaN ratio
     nan_ratio = X_clean.isna().mean()
     valid_cols = nan_ratio[nan_ratio < 0.5].index.tolist()
     X_clean = X_clean[valid_cols]
     
-    # For remaining NaN values, fill with column median (robust to outliers)
-    for col in X_clean.columns:
-        if X_clean[col].isna().any():
-            median_val = X_clean[col].median()
-            if pd.isna(median_val):
-                median_val = 0.0
-            X_clean[col] = X_clean[col].fillna(median_val)
+    # Step 3: Fill remaining NaN with 0 (safest approach)
+    X_clean = X_clean.fillna(0.0)
     
-    # Align y with cleaned X (in case rows were dropped)
+    # Step 4: Drop any rows that still have NaN (shouldn't happen but be safe)
+    valid_rows = ~X_clean.isna().any(axis=1)
+    X_clean = X_clean.loc[valid_rows]
+    
+    # Step 5: Final safety check - convert to numpy and back to ensure clean
+    X_values = X_clean.values
+    if np.any(np.isnan(X_values)) or np.any(np.isinf(X_values)):
+        # Nuclear option: replace all non-finite values with 0
+        X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+        X_clean = pd.DataFrame(X_values, index=X_clean.index, columns=X_clean.columns)
+    
+    # Align y with cleaned X
     y_clean_input = y.loc[X_clean.index]
     
     # Get OOF predictions
@@ -329,12 +341,20 @@ def train_stacking_ensemble(
     # Train final base models on full cleaned data
     print("  Training final base models on full data...")
     final_base_models = {}
+    
+    # Convert to numpy arrays to ensure no NaN issues
+    X_train_arr = np.nan_to_num(X_clean.values, nan=0.0, posinf=0.0, neginf=0.0)
+    y_train_arr = np.nan_to_num(y_clean_input.values, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Create clean DataFrame for models that need it
+    X_train_clean = pd.DataFrame(X_train_arr, index=X_clean.index, columns=X_clean.columns)
+    
     for model_name, model in base_models.items():
         try:
             from sklearn.base import clone
 
             model_clone = clone(model)
-            model_clone.fit(X_clean, y_clean_input)
+            model_clone.fit(X_train_clean, y_train_arr)
             final_base_models[model_name] = model_clone
         except Exception as e:
             warnings.warn(f"Failed to train final {model_name}: {e}")
@@ -374,23 +394,20 @@ def predict_with_ensemble(
     
     # FIX: Apply same cleaning as during training
     X_clean = X.copy()
-    X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
     
     # Use only the valid columns from training if available
     if "valid_feature_cols" in ensemble:
         valid_cols = [c for c in ensemble["valid_feature_cols"] if c in X_clean.columns]
         X_clean = X_clean[valid_cols]
     
-    # Fill NaN with 0 (same as training)
-    for col in X_clean.columns:
-        if X_clean[col].isna().any():
-            X_clean[col] = X_clean[col].fillna(0.0)
+    # Convert to clean numpy array - same as training
+    X_arr = np.nan_to_num(X_clean.values, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Get base model predictions
     base_predictions = pd.DataFrame(index=X_clean.index)
     for model_name, model in base_models.items():
         try:
-            pred = model.predict(X_clean)
+            pred = model.predict(X_arr)
             base_predictions[model_name] = pred
         except Exception as e:
             warnings.warn(f"Prediction failed for {model_name}: {e}")
