@@ -37,9 +37,17 @@ ml = [
     "statsmodels>=0.14.0",
 ]
 
+# --- ADDED: Shortcut for installing all optional dependencies ---
+all = ["nexussignal[dev,ml]"]
+
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# --- ADDED: Configuration to resolve the package discovery error ---
+[tool.setuptools.packages.find]
+# This tells setuptools to look for packages in the current directory (flat layout)
+where = ["."]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

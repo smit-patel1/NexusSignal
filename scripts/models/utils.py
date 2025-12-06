@@ -95,15 +95,17 @@ def create_sequence_dataset(
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     """
-    Compute regression metrics.
+    Compute regression metrics including financial-specific metrics.
 
     Args:
         y_true: True values
         y_pred: Predicted values
 
     Returns:
-        Dictionary with MAE, RMSE, R2, and directional accuracy
+        Dictionary with MAE, RMSE, R2, directional accuracy, IC, and hit rates
     """
+    from scipy.stats import spearmanr
+
     mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     r2 = r2_score(y_true, y_pred)
@@ -111,11 +113,25 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     # Directional accuracy: percentage of correct sign predictions
     directional_acc = np.mean(np.sign(y_true) == np.sign(y_pred))
 
+    # FIX: Add financial metrics
+    # Information Coefficient (Spearman correlation)
+    ic, ic_pval = spearmanr(y_true, y_pred)
+
+    # Hit rates for positive/negative returns
+    pos_mask = y_true > 0
+    neg_mask = y_true < 0
+    hit_rate_pos = np.mean(y_pred[pos_mask] > 0) if pos_mask.sum() > 0 else 0.0
+    hit_rate_neg = np.mean(y_pred[neg_mask] < 0) if neg_mask.sum() > 0 else 0.0
+
     return {
         'mae': mae,
         'rmse': rmse,
         'r2': r2,
-        'directional_accuracy': directional_acc
+        'directional_accuracy': directional_acc,
+        'information_coefficient': ic,
+        'ic_pvalue': ic_pval,
+        'hit_rate_positive': hit_rate_pos,
+        'hit_rate_negative': hit_rate_neg,
     }
 
 
@@ -133,3 +149,7 @@ def print_metrics(metrics: dict, model_name: str, prefix: str = "") -> None:
     print(f"{prefix}  RMSE: {metrics['rmse']:.6f}")
     print(f"{prefix}  R²: {metrics['r2']:.4f}")
     print(f"{prefix}  Directional Accuracy: {metrics['directional_accuracy']:.2%}")
+    # FIX: Print financial metrics
+    if 'information_coefficient' in metrics:
+        print(f"{prefix}  IC: {metrics['information_coefficient']:.4f} (p={metrics['ic_pvalue']:.4f})")
+        print(f"{prefix}  Hit Rate+: {metrics['hit_rate_positive']:.2%}, Hit Rate-: {metrics['hit_rate_negative']:.2%}")

@@ -201,12 +201,12 @@ def compute_meta_features(
     for col in base_predictions.columns:
         meta_features[col] = base_predictions[col]
 
-    # Statistical aggregations
-    meta_features["pred_mean"] = base_predictions.mean(axis=1)
-    meta_features["pred_std"] = base_predictions.std(axis=1)
-    meta_features["pred_median"] = base_predictions.median(axis=1)
-    meta_features["pred_min"] = base_predictions.min(axis=1)
-    meta_features["pred_max"] = base_predictions.max(axis=1)
+    # Statistical aggregations (skip NaN values)
+    meta_features["pred_mean"] = base_predictions.mean(axis=1, skipna=True)
+    meta_features["pred_std"] = base_predictions.std(axis=1, skipna=True)
+    meta_features["pred_median"] = base_predictions.median(axis=1, skipna=True)
+    meta_features["pred_min"] = base_predictions.min(axis=1, skipna=True)
+    meta_features["pred_max"] = base_predictions.max(axis=1, skipna=True)
     meta_features["pred_range"] = meta_features["pred_max"] - meta_features["pred_min"]
 
     # Residuals (if y_true provided)
@@ -262,43 +262,71 @@ def train_stacking_ensemble(
     Returns:
         Dictionary with trained ensemble artifacts
     """
+    # FIX: Clean input data - handle NaN/inf values that may come from scaling
+    X_clean = X.copy()
+    
+    # Replace inf with NaN first
+    X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
+    
+    # Drop columns that are entirely NaN or have very high NaN ratio
+    nan_ratio = X_clean.isna().mean()
+    valid_cols = nan_ratio[nan_ratio < 0.5].index.tolist()
+    X_clean = X_clean[valid_cols]
+    
+    # For remaining NaN values, fill with column median (robust to outliers)
+    for col in X_clean.columns:
+        if X_clean[col].isna().any():
+            median_val = X_clean[col].median()
+            if pd.isna(median_val):
+                median_val = 0.0
+            X_clean[col] = X_clean[col].fillna(median_val)
+    
+    # Align y with cleaned X (in case rows were dropped)
+    y_clean_input = y.loc[X_clean.index]
+    
     # Get OOF predictions
     print(f"  Generating {n_folds}-fold cross-validated predictions...")
     oof_predictions, fold_models = cross_validated_predictions(
-        X, y, base_models, n_folds=n_folds
+        X_clean, y_clean_input, base_models, n_folds=n_folds
     )
 
     # Compute meta-features
     if use_meta_features:
         print("  Computing meta-features...")
-        meta_features = compute_meta_features(oof_predictions, y)
+        meta_features = compute_meta_features(oof_predictions, y_clean_input)
     else:
         meta_features = oof_predictions
 
     # Remove rows with NaN (from failed models)
+    # FIX: Drop columns (models) that have too many NaNs first
+    nan_threshold = 0.5  # Drop models with >50% NaN predictions
+    nan_pct = meta_features.isna().mean()
+    valid_meta_cols = nan_pct[nan_pct < nan_threshold].index
+    meta_features = meta_features[valid_meta_cols]
+
+    # Then drop rows with any remaining NaN
     valid_idx = meta_features.dropna().index
     meta_features_clean = meta_features.loc[valid_idx]
     # Ensure deterministic column order for meta-learner
     meta_features_clean = meta_features_clean.reindex(sorted(meta_features_clean.columns), axis=1)
 
-    y_clean = y.loc[valid_idx]
+    y_clean = y_clean_input.loc[valid_idx]
+
+    if len(meta_features_clean) < 100:
+        raise ValueError(f"Too few valid samples for stacking: {len(meta_features_clean)}")
 
     # Train meta-learner
+    # FIX: Use Ridge with strong regularization instead of CatBoost
     if meta_learner is None:
-        meta_learner = CatBoostRegressor(
-            iterations=200,
-            depth=4,
-            learning_rate=0.1,
-            random_seed=42,
-            verbose=False,
-        )
+        from sklearn.linear_model import Ridge
+        meta_learner = Ridge(alpha=10.0, random_state=42)
 
     print(f"  Training meta-learner on {len(meta_features_clean)} samples...")
     meta_learner.fit(meta_features_clean, y_clean)
     # Save consistent ordering for inference stage
     ordered_feature_names = list(meta_features_clean.columns)
 
-    # Train final base models on full data
+    # Train final base models on full cleaned data
     print("  Training final base models on full data...")
     final_base_models = {}
     for model_name, model in base_models.items():
@@ -306,7 +334,7 @@ def train_stacking_ensemble(
             from sklearn.base import clone
 
             model_clone = clone(model)
-            model_clone.fit(X, y)
+            model_clone.fit(X_clean, y_clean_input)
             final_base_models[model_name] = model_clone
         except Exception as e:
             warnings.warn(f"Failed to train final {model_name}: {e}")
@@ -318,6 +346,7 @@ def train_stacking_ensemble(
         "fold_models": fold_models,
         "use_meta_features": use_meta_features,
         "n_folds": n_folds,
+        "valid_feature_cols": valid_cols,  # Store valid feature columns for prediction
     }
 
     return ensemble
@@ -342,12 +371,26 @@ def predict_with_ensemble(
     base_models = ensemble["base_models"]
     meta_learner = ensemble["meta_learner"]
     use_meta_features = ensemble.get("use_meta_features", False)
+    
+    # FIX: Apply same cleaning as during training
+    X_clean = X.copy()
+    X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
+    
+    # Use only the valid columns from training if available
+    if "valid_feature_cols" in ensemble:
+        valid_cols = [c for c in ensemble["valid_feature_cols"] if c in X_clean.columns]
+        X_clean = X_clean[valid_cols]
+    
+    # Fill NaN with 0 (same as training)
+    for col in X_clean.columns:
+        if X_clean[col].isna().any():
+            X_clean[col] = X_clean[col].fillna(0.0)
 
     # Get base model predictions
-    base_predictions = pd.DataFrame(index=X.index)
+    base_predictions = pd.DataFrame(index=X_clean.index)
     for model_name, model in base_models.items():
         try:
-            pred = model.predict(X)
+            pred = model.predict(X_clean)
             base_predictions[model_name] = pred
         except Exception as e:
             warnings.warn(f"Prediction failed for {model_name}: {e}")

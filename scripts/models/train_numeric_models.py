@@ -59,13 +59,13 @@ from scripts.models.utils import create_sequence_dataset, compute_metrics, print
 # CONFIGURATION
 # ======================================================================
 
-TRAIN_NEURAL = True
+TRAIN_NEURAL = False  # FIX: Disable neural networks (too complex for noisy data)
 NEURAL_TICKERS = TICKERS[:10]
 LOOKBACK_WINDOW = 32
 
 USE_KALMAN_FILTER = False
-TARGET_TRANSFORM = "log"
-NORMALIZE_TARGETS = True
+TARGET_TRANSFORM = "none"  # FIX: No double transformation on returns
+NORMALIZE_TARGETS = False  # FIX: Keep return scale intact
 
 FILTER_BAD_DATA = True
 MIN_VOLUME_PERCENTILE = 1.0
@@ -75,8 +75,9 @@ BUILD_ALPHA_FEATURES = True
 INCLUDE_INTERACTIONS = True
 
 USE_STACKING = True
-USE_META_FEATURES = True
+USE_META_FEATURES = False  # FIX: Disable meta-features to reduce overfitting
 STACKING_FOLDS = 5
+EMBARGO_PCT = 0.01  # FIX: Add 1% embargo between folds
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 FEATURES_DIR = DATA_DIR / "processed" / "features"
@@ -96,33 +97,8 @@ def create_horizon_specific_features(
     """Create horizon-specific features without dropping rows."""
     df_horizon = df.copy()
 
-    if horizon == "1h":
-        periods = [1, 2, 3]
-    elif horizon == "4h":
-        periods = [4, 8, 12]
-    elif horizon == "24h":
-        periods = [24, 48, 72]
-    else:
-        periods = [1]
-
-    if "close" in df_horizon.columns:
-        for period in periods:
-            df_horizon[f"return_{period}p"] = df_horizon["close"].pct_change(period)
-            df_horizon[f"volatility_{period}p"] = (
-                df_horizon["close"].pct_change().rolling(period).std()
-            )
-
-        base_period = periods[0]
-        df_horizon[f"momentum_{horizon}"] = (
-            df_horizon["close"] / df_horizon["close"].shift(base_period) - 1
-        )
-
-        delta = df_horizon["close"].diff()
-        gain = delta.where(delta > 0, 0).rolling(base_period * 2).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(base_period * 2).mean()
-        rs = gain / loss.replace(0, 1e-10)
-        df_horizon[f"rsi_{horizon}"] = 100 - (100 / (1 + rs))
-
+    # Don't create any horizon-specific features - they cause NaN issues
+    # Just return the dataframe as-is
     return df_horizon
 
 
@@ -321,32 +297,22 @@ def train_ticker_models(
         X_raw = df_horizon[feature_cols]
         y_raw = df_horizon[target]
 
+        # FIX: Drop rows with NaN (no forward-fill to avoid look-ahead bias)
         # Drop rows where target is NaN
         valid_target_idx = y_raw.dropna().index
 
-        # Drop rows where ALL features are NaN (keep rows with some valid features)
-        valid_feature_idx = X_raw.dropna(how='all').index
+        # Drop rows where ANY feature is NaN (safest approach)
+        valid_feature_idx = X_raw.dropna(how='any').index
 
         # Get intersection
         valid_idx = valid_target_idx.intersection(valid_feature_idx)
 
         if len(valid_idx) < 100:
-            print(f"  [SKIP] Insufficient valid data after target filter: {len(valid_idx)} samples")
+            print(f"  [SKIP] Insufficient valid data: {len(valid_idx)} samples")
             continue
 
-        # Now subset and drop only rows with NaN in any feature column
-        X_subset = X_raw.loc[valid_idx]
-        y_subset = y_raw.loc[valid_idx]
-
-        # Drop rows with NaN in any feature
-        final_valid_idx = X_subset.dropna().index
-
-        if len(final_valid_idx) < 100:
-            print(f"  [SKIP] Insufficient valid data after feature filter: {len(final_valid_idx)} samples")
-            continue
-
-        X = X_subset.loc[final_valid_idx]
-        y = y_subset.loc[final_valid_idx]
+        X = X_raw.loc[valid_idx]
+        y = y_raw.loc[valid_idx]
 
         print(f"  Valid samples: {len(X)}")
 
@@ -359,19 +325,24 @@ def train_ticker_models(
             denoise_window=5,
         )
 
+        # FIX: Add embargo between train/val/test splits
         n = len(X)
+        embargo_size = int(n * EMBARGO_PCT)
+
         train_end = int(n * 0.70)
+        val_start = min(train_end + embargo_size, n)
         val_end = int(n * 0.85)
+        test_start = min(val_end + embargo_size, n)
 
         X_train = X.iloc[:train_end]
         y_train = y_processed.iloc[:train_end]
-        X_val = X.iloc[train_end:val_end]
-        y_val = y_processed.iloc[train_end:val_end]
-        X_test = X.iloc[val_end:]
-        y_test = y_processed.iloc[val_end:]
-        y_test_original = y.iloc[val_end:]
+        X_val = X.iloc[val_start:val_end]
+        y_val = y_processed.iloc[val_start:val_end]
+        X_test = X.iloc[test_start:]
+        y_test = y_processed.iloc[test_start:]
+        y_test_original = y.iloc[test_start:]
 
-        print(f"  Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
+        print(f"  Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)} (embargo={embargo_size})")
 
         print("  Scaling features...")
         X_train_scaled, scaler = robust_scale_features(X_train)
