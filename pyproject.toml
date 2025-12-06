@@ -35,6 +35,12 @@ ml = [
     "joblib>=1.3.0",
     "scipy>=1.11.0",
     "statsmodels>=0.14.0",
+    "hmmlearn>=0.3.0",
+    "hydra-core>=1.3.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "tqdm>=4.65.0",
+    "numba>=0.57.0",
 ]
 
 # --- ADDED: Shortcut for installing all optional dependencies ---
@@ -48,6 +54,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 # This tells setuptools to look for packages in the current directory (flat layout)
 where = ["."]
+include = ["nexus2*"]
+exclude = ["tests*", "scripts*", "backend*", "dashboard*", "notebooks*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

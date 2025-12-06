@@ -4,111 +4,68 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+dist/
+build/
 
-# Virtual Environment
+# Virtual environments
 venv/
-.venv/
 env/
 ENV/
-env.bak/
-venv.bak/
-.env.example
+.venv
+
+# Data (don't commit large data files to git)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+
+# Model outputs
+outputs/models/*
+!outputs/models/.gitkeep
+outputs/predictions/*
+!outputs/predictions/.gitkeep
+outputs/logs/*
+!outputs/logs/.gitkeep
+outputs/results/*
+!outputs/results/.gitkeep
+
+# Training artifacts
+catboost_info/
+lightning_logs/
+mlruns/
+*.log
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.joblib
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
-.DS_Store
-.claude
+*.sublime-*
 
-# Environment Variables
+# Environment
 .env
-.env.local
-.env.*.local
-
-# Data Files - RAW DATA (can be regenerated)
-data/raw/prices/*
-!data/raw/prices/.gitkeep
-
-data/raw/news/*
-!data/raw/news/.gitkeep
-
-# Data Files - PROCESSED FEATURES (can be regenerated)
-data/processed/features/*
-!data/processed/features/.gitkeep
-
-# Zip archives of data
-data/processed/*.zip
-data/raw/*.zip
-
-# Trained Models (generated during Phase 3+)
-models/numeric/*.pkl
-models/numeric/*.joblib
-models/numeric/*.h5
-models/numeric/*.pt
-models/numeric/*.pth
-models/nlp/*.pkl
-models/nlp/*.joblib
-models/nlp/*.h5
-models/nlp/*.pt
-models/nlp/*.pth
-models/meta/*.pkl
-models/meta/*.joblib
-models/meta/*.h5
-models/meta/*.pt
-models/meta/*.pth
-
-# Model metadata and logs
-models/*/logs/
-models/*/checkpoints/
-models/*/runs/
-
-# Jupyter Notebooks
-.ipynb_checkpoints/
-*.ipynb
-
-# Logs
-*.log
-logs/
-pipeline_output.log
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
+*.env
+!.env.example
 
 # OS
+.DS_Store
 Thumbs.db
 desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
 
 # Temporary files
 *.tmp
 *.bak
-*.swp
+*~
 nul

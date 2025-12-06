@@ -1,0 +1,236 @@
+# NexusSignal 2.0
+
+## Production-Grade Quantitative Research System
+
+A complete redesign of NexusSignal following modern financial ML best practices from Lopez de Prado's "Advances in Financial Machine Learning" and related research.
+
+## Key Improvements Over v1
+
+| Aspect           | v1 (Legacy)            | v2 (New)                         |
+| ---------------- | ---------------------- | -------------------------------- |
+| **Labeling**     | Fixed-horizon returns  | Triple Barrier Method            |
+| **Features**     | Technical indicators   | +Microstructure, Entropy, Regime |
+| **Stationarity** | None                   | Fractional Differencing          |
+| **Validation**   | Train/Val/Test split   | Combinatorial Purged CV          |
+| **Models**       | Point regression (MSE) | Probabilistic classification     |
+| **Outputs**      | Single prediction      | Distributions + Confidence       |
+| **Signal Gen**   | Raw predictions        | Meta-labeling + Position sizing  |
+
+## Architecture Overview
+
+```
+nexus2/
+├── config.py               # Pydantic configuration system
+├── config_default.yaml     # Default configuration
+├── data/
+│   ├── fractional_diff.py  # FFD for stationarity
+│   └── sampling.py         # Event-based sampling, volatility
+├── labeling/
+│   ├── triple_barrier.py   # TBM label generation
+│   └── meta_labeling.py    # Meta-labeling for filtering
+├── features/
+│   ├── microstructure.py   # VPIN, Kyle's Lambda, Roll spread
+│   ├── entropy.py          # ApEn, SampEn, PermEn
+│   ├── regime.py           # HMM regime detection
+│   └── builder.py          # Unified feature builder
+├── models/
+│   ├── quantile_nn.py      # Quantile Regression NN
+│   ├── mdn.py              # Mixture Density Network
+│   └── classifier.py       # Barrier classifier
+├── validation/
+│   ├── cpcv.py            # Combinatorial Purged CV
+│   └── metrics.py          # Financial metrics (DSR, PSR)
+├── signals/
+│   ├── generator.py        # Signal generation
+│   └── sizing.py           # Position sizing (Kelly, vol-scaled)
+└── pipeline/
+    └── trainer.py          # Complete training pipeline
+```
+
+## Quick Start
+
+### 1. Install Dependencies
+
+```bash
+pip install -e ".[ml]"
+```
+
+### 2. Train Models
+
+```bash
+# Train all configured tickers
+python -m nexus2.run_training
+
+# Train single ticker
+python -m nexus2.run_training --ticker AAPL
+
+# Use custom config
+python -m nexus2.run_training --config my_config.yaml
+```
+
+### 3. Programmatic Usage
+
+```python
+from nexus2.config import NexusConfig
+from nexus2.pipeline.trainer import NexusTrainer
+
+# Load configuration
+config = NexusConfig()
+
+# Create trainer
+trainer = NexusTrainer(config)
+
+# Train single ticker
+result = trainer.train_ticker('AAPL')
+
+# Access results
+print(f"CV Accuracy: {result.primary_metrics['mean_cv_accuracy']:.2%}")
+print(f"Sharpe Ratio: {result.signal_metrics['sharpe_ratio']:.2f}")
+```
+
+## Core Components
+
+### 1. Triple Barrier Method (TBM)
+
+Instead of predicting raw returns, TBM defines tradable outcomes:
+
+- **Upper barrier**: Profit-taking target (label = 1)
+- **Lower barrier**: Stop-loss (label = -1)
+- **Vertical barrier**: Time expiry (label based on return sign)
+
+```python
+from nexus2.labeling.triple_barrier import TripleBarrierLabeler
+
+labeler = TripleBarrierLabeler(
+    pt_multiplier=2.0,   # 2x volatility for profit target
+    sl_multiplier=2.0,   # 2x volatility for stop loss
+    max_holding=24,      # Maximum 24 bars holding period
+)
+
+labels = labeler.fit_transform(df_ohlcv)
+```
+
+### 2. Fractional Differencing
+
+Makes series stationary while preserving memory:
+
+```python
+from nexus2.data.fractional_diff import find_optimal_d, frac_diff_ffd
+
+# Find minimum d for stationarity
+result = find_optimal_d(prices)
+print(f"Optimal d: {result['optimal_d']}")
+
+# Apply differencing
+prices_stationary = frac_diff_ffd(prices, d=result['optimal_d'])
+```
+
+### 3. Microstructure Features
+
+Capture market dynamics beyond price:
+
+- **VPIN**: Probability of informed trading
+- **Kyle's Lambda**: Price impact coefficient
+- **Roll Spread**: Implicit bid-ask spread
+- **Order Flow Imbalance**: Buy/sell pressure
+
+```python
+from nexus2.features.microstructure import build_microstructure_features
+
+features = build_microstructure_features(df, windows=[10, 20, 50])
+```
+
+### 4. Combinatorial Purged Cross-Validation
+
+Prevents information leakage in validation:
+
+```python
+from nexus2.validation.cpcv import CombinatorialPurgedCV
+
+cv = CombinatorialPurgedCV(
+    n_splits=5,
+    n_test_groups=2,
+    purge_length=24,
+    embargo_pct=0.01
+)
+
+for train_idx, test_idx in cv.split(X, labels):
+    model.fit(X.loc[train_idx], y.loc[train_idx])
+    score = model.score(X.loc[test_idx], y.loc[test_idx])
+```
+
+### 5. Probabilistic Models
+
+Output distributions, not point estimates:
+
+```python
+from nexus2.models.quantile_nn import QuantileRegressionNN
+
+model = QuantileRegressionNN(
+    input_dim=100,
+    quantiles=[0.05, 0.25, 0.5, 0.75, 0.95]
+)
+
+# Get distribution predictions
+preds = model.predict_distribution(X_test)
+print(f"Median: {preds['median']}")
+print(f"90% CI: [{preds['lower_90']}, {preds['upper_90']}]")
+```
+
+### 6. Meta-Labeling
+
+Filter signals by confidence:
+
+```python
+from nexus2.labeling.meta_labeling import MetaLabeler
+
+meta_labeler = MetaLabeler(min_confidence=0.55)
+
+# Get signals with filtering
+signals = meta_labeler.apply(primary_side, meta_probability)
+print(f"Filtered {(~signals['trade']).mean():.1%} of signals")
+```
+
+## Metrics
+
+Financial-specific evaluation metrics:
+
+- **Precision@K**: Accuracy of top-K signals
+- **Brier Score**: Probability calibration
+- **Deflated Sharpe Ratio**: Adjusts for multiple testing
+- **Probabilistic Sharpe Ratio**: P(true SR > benchmark)
+- **Hit Rate**: Directional accuracy
+
+## Configuration
+
+See `config_default.yaml` for all options. Key parameters:
+
+```yaml
+triple_barrier:
+  profit_taking_multiplier: 2.0
+  stop_loss_multiplier: 2.0
+  max_holding_period: 24
+
+validation:
+  method: "cpcv"
+  n_splits: 5
+  n_test_groups: 2
+  purge_length: 24
+
+model:
+  hidden_layers: [256, 128, 64]
+  dropout: 0.3
+  learning_rate: 0.001
+```
+
+## References
+
+1. Lopez de Prado, M. (2018). _Advances in Financial Machine Learning_. Wiley.
+2. Lopez de Prado, M. (2020). _Machine Learning for Asset Managers_. Cambridge.
+3. Bailey, D. & Lopez de Prado, M. (2014). "The Deflated Sharpe Ratio"
+4. Easley, D. et al. (2012). "VPIN and the Flash Crash"
+5. Kyle, A. (1985). "Continuous Auctions and Insider Trading"
+
+## License
+
+TBD

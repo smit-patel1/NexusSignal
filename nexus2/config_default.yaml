@@ -1,0 +1,132 @@
+# NexusSignal 2.0 Default Configuration
+# =====================================
+# This is the production-ready configuration following quant finance best practices.
+
+# Project paths
+data_dir: "data"
+models_dir: "models/nexus2"
+results_dir: "results/nexus2"
+
+# Tickers to process
+tickers:
+  - "AAPL"
+  - "MSFT"
+  - "NVDA"
+  - "GOOGL"
+  - "AMZN"
+  - "META"
+  - "TSLA"
+  - "JPM"
+  - "V"
+  - "XOM"
+
+# Base timeframe
+base_timeframe: "1h"
+
+# Random seed
+seed: 42
+
+# Fractional Differencing Configuration
+frac_diff:
+  d_min: 0.0
+  d_max: 1.0
+  d_step: 0.05
+  adf_threshold: 0.05
+  weight_threshold: 1.0e-5
+  max_lag: 100
+
+# Triple Barrier Method Configuration
+triple_barrier:
+  # Barrier widths as multiples of volatility
+  profit_taking_multiplier: 2.0
+  stop_loss_multiplier: 2.0
+  
+  # Maximum holding period in bars
+  max_holding_period: 24
+  
+  # Volatility estimation
+  volatility_lookback: 20
+  volatility_method: "yang_zhang"  # Most robust to overnight gaps
+  
+  # Minimum return threshold for non-zero label at vertical barrier
+  min_return_threshold: 0.0001
+  
+  # Whether to use side prediction for asymmetric barriers
+  use_side_prediction: true
+
+# Meta-Labeling Configuration
+meta_labeling:
+  enabled: true
+  min_confidence: 0.55
+  bet_sizing_method: "sigmoid"  # Options: equal, linear, sigmoid, kelly
+  kelly_fraction: 0.25
+
+# Feature Engineering Configuration
+features:
+  # Microstructure features
+  vpin_volume_buckets: 50
+  vpin_window: 20
+  kyle_lambda_window: 20
+  roll_spread_window: 20
+  
+  # Entropy features
+  entropy_embedding_dim: 2
+  entropy_tolerance: 0.2
+  entropy_window: 50
+  
+  # Regime detection
+  hmm_n_regimes: 3
+  hmm_n_iter: 100
+  
+  # Technical features
+  technical_windows: [5, 10, 20, 50]
+  
+  # Fractional differencing
+  apply_frac_diff: true
+
+# Model Architecture Configuration
+model:
+  # Model type: quantile_nn, mdn, or ensemble
+  model_type: "barrier_classifier"
+  
+  # For quantile regression
+  quantiles: [0.05, 0.25, 0.5, 0.75, 0.95]
+  
+  # Network architecture
+  hidden_layers: [256, 128, 64]
+  dropout: 0.3
+  
+  # For MDN
+  n_mixtures: 5
+  
+  # Training parameters
+  learning_rate: 0.001
+  weight_decay: 1.0e-5
+  batch_size: 256
+  max_epochs: 100
+  early_stopping_patience: 15
+  
+  # Learning rate scheduler
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+
+# Validation Configuration
+validation:
+  # Method: cpcv, purged_kfold, walk_forward
+  method: "cpcv"
+  
+  # CPCV parameters
+  n_splits: 5
+  n_test_groups: 2
+  
+  # Purging and embargo
+  purge_length: 24  # Must be >= max_holding_period
+  embargo_pct: 0.01
+
+# Signal Generation Configuration
+signal:
+  min_probability: 0.55
+  position_sizing: "volatility_scaled"  # Options: equal, volatility_scaled, kelly
+  max_position: 1.0
+  target_volatility: 0.15  # 15% annualized target
+
