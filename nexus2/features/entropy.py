@@ -14,6 +14,7 @@ Reference: Pincus (1991), Richman & Moorman (2000)
 """
 
 from typing import Optional
+import math
 import numpy as np
 import pandas as pd
 from numba import jit
@@ -235,7 +236,7 @@ def permutation_entropy(
     
     if normalize:
         # Maximum entropy = log(order!)
-        max_entropy = np.log(np.math.factorial(order))
+        max_entropy = np.log(math.factorial(order))
         entropy = entropy / max_entropy
     
     return entropy
