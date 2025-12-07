@@ -182,6 +182,10 @@ class PurgedKFold:
         n_samples = len(all_idx)
         fold_size = n_samples // self.n_splits
         
+        # Align labels to X's index if provided
+        if labels is not None:
+            labels = labels.loc[labels.index.intersection(all_idx)]
+        
         for fold in range(self.n_splits):
             # Test range for this fold
             test_start_pos = fold * fold_size
@@ -190,11 +194,14 @@ class PurgedKFold:
             test_start = all_idx[test_start_pos]
             test_end = all_idx[test_end_pos - 1]
             
-            if labels is not None:
+            if labels is not None and len(labels) > 0:
                 train_idx, test_idx = compute_purge_embargo(
                     labels, test_start, test_end,
                     self.purge_length, self.embargo_pct
                 )
+                # Ensure indices are within X's index
+                train_idx = train_idx.intersection(all_idx)
+                test_idx = test_idx.intersection(all_idx)
             else:
                 # Simple split without purging
                 test_idx = all_idx[test_start_pos:test_end_pos]
@@ -204,6 +211,10 @@ class PurgedKFold:
                 
                 train_mask = (all_idx < test_start) | (all_idx >= all_idx[embargo_end_pos])
                 train_idx = all_idx[train_mask]
+            
+            # Skip empty folds
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
             
             yield train_idx, test_idx
     
@@ -281,6 +292,10 @@ class CombinatorialPurgedCV:
         n_samples = len(all_idx)
         group_size = n_samples // self.n_splits
         
+        # Align labels to X's index if provided
+        if labels is not None:
+            labels = labels.loc[labels.index.intersection(all_idx)]
+        
         # Create groups
         groups = []
         for i in range(self.n_splits):
@@ -300,18 +315,12 @@ class CombinatorialPurgedCV:
             train_idx_list = [groups[i] for i in train_groups]
             train_idx = pd.DatetimeIndex(np.concatenate([idx.values for idx in train_idx_list]))
             
-            if labels is not None:
+            if labels is not None and len(labels) > 0:
                 # Apply purging for each test group boundary
                 for test_group_idx in test_group_indices:
                     test_group = groups[test_group_idx]
                     test_start = test_group[0]
                     test_end = test_group[-1]
-                    
-                    # Use full labels for purge calculation (need t1 column)
-                    # Filter to indices that exist in labels
-                    valid_train_idx = train_idx.intersection(labels.index)
-                    if len(valid_train_idx) == 0:
-                        continue
                     
                     purge_train_idx, _ = compute_purge_embargo(
                         labels,
@@ -319,6 +328,7 @@ class CombinatorialPurgedCV:
                         self.purge_length, self.embargo_pct
                     )
                     
+                    # Intersect with current train_idx, ensuring we stay within X's index
                     train_idx = train_idx.intersection(purge_train_idx)
             else:
                 # Simple embargo without labels
@@ -335,6 +345,14 @@ class CombinatorialPurgedCV:
                     # Remove embargo from train
                     embargo_idx = all_idx[test_end_pos + 1:embargo_end_pos + 1]
                     train_idx = train_idx.difference(embargo_idx)
+            
+            # Final safety check: ensure indices are in X's index
+            train_idx = train_idx.intersection(all_idx)
+            test_idx = test_idx.intersection(all_idx)
+            
+            # Skip if either is empty
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
             
             yield train_idx.sort_values(), test_idx
     
