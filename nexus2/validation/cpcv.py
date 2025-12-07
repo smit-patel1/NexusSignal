@@ -80,6 +80,11 @@ def compute_purge_embargo(
     all_idx = labels.index
     n_samples = len(all_idx)
     
+    # Handle empty labels case
+    if n_samples == 0:
+        empty_idx = pd.DatetimeIndex([])
+        return empty_idx, empty_idx
+    
     # Test indices
     test_mask = (all_idx >= test_start) & (all_idx <= test_end)
     test_idx = all_idx[test_mask]
@@ -89,9 +94,13 @@ def compute_purge_embargo(
     embargo_length = max(1, int(n_test * embargo_pct))
     
     # Embargo after test
-    test_end_pos = all_idx.get_loc(test_idx[-1]) if len(test_idx) > 0 else 0
-    embargo_end_pos = min(test_end_pos + embargo_length, n_samples - 1)
-    embargo_end = all_idx[embargo_end_pos]
+    if len(test_idx) > 0:
+        test_end_pos = all_idx.get_loc(test_idx[-1])
+        embargo_end_pos = min(test_end_pos + embargo_length, n_samples - 1)
+        embargo_end = all_idx[embargo_end_pos]
+    else:
+        # No test samples - no embargo needed
+        embargo_end = test_end
     
     # Purge before test (samples whose labels extend into test)
     if 't1' in labels.columns:
@@ -100,7 +109,11 @@ def compute_purge_embargo(
         purge_idx = labels.index[purge_mask]
     else:
         # Fallback: purge fixed number of bars
-        test_start_pos = all_idx.get_loc(test_start) if test_start in all_idx else 0
+        if test_start in all_idx:
+            test_start_pos = all_idx.get_loc(test_start)
+        else:
+            # Find closest position
+            test_start_pos = all_idx.searchsorted(test_start)
         purge_start_pos = max(0, test_start_pos - purge_length)
         purge_idx = all_idx[purge_start_pos:test_start_pos]
     
@@ -294,8 +307,14 @@ class CombinatorialPurgedCV:
                     test_start = test_group[0]
                     test_end = test_group[-1]
                     
+                    # Use full labels for purge calculation (need t1 column)
+                    # Filter to indices that exist in labels
+                    valid_train_idx = train_idx.intersection(labels.index)
+                    if len(valid_train_idx) == 0:
+                        continue
+                    
                     purge_train_idx, _ = compute_purge_embargo(
-                        labels.loc[train_idx] if train_idx.isin(labels.index).all() else labels,
+                        labels,
                         test_start, test_end,
                         self.purge_length, self.embargo_pct
                     )
