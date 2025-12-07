@@ -14,28 +14,15 @@ env/
 ENV/
 .venv
 
-# Data rules
-# Ignore everything by default, but allow parquet files and .gitkeep
-
-# RAW DATA
+# Data (don't commit large data files to git)
 data/raw/*
 !data/raw/.gitkeep
-!data/raw/**/*.parquet
-!data/raw/*.parquet
-
-# PROCESSED DATA
 data/processed/*
 !data/processed/.gitkeep
-!data/processed/**/*.parquet
-!data/processed/*.parquet
-
-# INTERIM DATA
 data/interim/*
 !data/interim/.gitkeep
-!data/interim/**/*.parquet
-!data/interim/*.parquet
 
-# Model outputs (ignored)
+# Model outputs
 outputs/models/*
 !outputs/models/.gitkeep
 outputs/predictions/*
